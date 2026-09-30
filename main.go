@@ -417,6 +417,10 @@ func (h *relayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		data, _ := json.Marshal(map[string]string{"status": "ok", "version": version})
 		_, _ = w.Write(data)
+	case "/ready":
+		w.Header().Set("Content-Type", "application/json")
+		data, _ := json.Marshal(map[string]string{"status": "ready"})
+		_, _ = w.Write(data)
 	case "/ws":
 		h.handleWS(w, r)
 	default:
@@ -433,6 +437,14 @@ func (h *relayHandler) handleWS(w http.ResponseWriter, r *http.Request) {
 
 	if serverId == "" {
 		http.Error(w, "Missing serverId", http.StatusBadRequest)
+		return
+	}
+	if len(serverId) > 256 {
+		http.Error(w, "serverId is too long", http.StatusBadRequest)
+		return
+	}
+	if len(connectionId) > 256 {
+		http.Error(w, "connectionId is too long", http.StatusBadRequest)
 		return
 	}
 	if role != "server" && role != "client" {
