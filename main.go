@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -36,11 +37,14 @@ var version = "dev"
 
 // ---- WebSocket upgrader ----
 
+// defaultMaxMessageBytes is the default maximum size of a single WebSocket message (32 MiB).
+const defaultMaxMessageBytes = 32 * 1024 * 1024
+
 // maxMessageBytes is the maximum size of a single WebSocket message.
-const maxMessageBytes = 32 * 1024 * 1024 // 32 MiB
+var maxMessageBytes int = defaultMaxMessageBytes
 
 // maxPendingBytes is the maximum total bytes buffered per pending frameBuffer.
-const maxPendingBytes = maxMessageBytes + 1 // message plus 1-byte type prefix
+var maxPendingBytes int = maxMessageBytes + 1 // message plus 1-byte type prefix
 
 var upgrader = websocket.Upgrader{
 	HandshakeTimeout: 10 * time.Second,
@@ -98,19 +102,20 @@ func (b *frameBuffer) push(msgType int, data []byte) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	frameLen := len(frame)
 	// Drop the new frame if it alone exceeds the byte limit.
-	if len(frame) > b.maxBytes {
+	if frameLen > b.maxBytes {
 		return
 	}
 
 	// Evict oldest frames until we have room for the new one.
-	for b.totalBytes+len(frame) > b.maxBytes && len(b.frames) > 0 {
+	for b.totalBytes+frameLen > b.maxBytes && len(b.frames) > 0 {
 		b.totalBytes -= len(b.frames[0])
 		b.frames = b.frames[1:]
 	}
 
 	b.frames = append(b.frames, frame)
-	b.totalBytes += len(frame)
+	b.totalBytes += frameLen
 
 	// Also enforce the item count limit by dropping oldest.
 	if len(b.frames) > b.maxItems {
@@ -402,7 +407,8 @@ func (r *registry) startEvictionLoop(ctx context.Context, interval time.Duration
 // ---- HTTP handler ----
 
 type relayHandler struct {
-	reg *registry
+	reg               *registry
+	dataAttachTimeout time.Duration
 }
 
 func (h *relayHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -443,7 +449,7 @@ func (h *relayHandler) handleWS(w http.ResponseWriter, r *http.Request) {
 		slog.Error("websocket upgrade failed", "err", err)
 		return
 	}
-	ws.SetReadLimit(maxMessageBytes)
+	ws.SetReadLimit(int64(maxMessageBytes))
 
 	sess, ok := h.reg.get(serverId)
 	if !ok {
@@ -593,6 +599,20 @@ func (h *relayHandler) handleClient(sess *session, c *conn, serverId, connection
 	sess.notifyControl(map[string]any{"type": "connected", "connectionId": connectionId})
 	sess.nudgeOrResetControl(connectionId)
 
+	timeout := h.dataAttachTimeout
+	if timeout <= 0 {
+		timeout = 15 * time.Second
+	}
+	attachTimer := time.AfterFunc(timeout, func() {
+		p.mu.RLock()
+		hasData := p.serverData != nil
+		p.mu.RUnlock()
+		if !hasData {
+			c.close(1013, "Data route unavailable")
+		}
+	})
+	defer attachTimer.Stop()
+
 	defer func() {
 		p.mu.Lock()
 		list := p.clients
@@ -670,14 +690,40 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
+func envOrDefaultInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if val, err := strconv.ParseInt(v, 10, 64); err == nil && val > 0 {
+			return val
+		}
+	}
+	return def
+}
+
+func envOrDefaultDuration(key string, def time.Duration) time.Duration {
+	if v := os.Getenv(key); v != "" {
+		if val, err := time.ParseDuration(v); err == nil && val > 0 {
+			return val
+		}
+		if ms, err := strconv.Atoi(v); err == nil && ms > 0 {
+			return time.Duration(ms) * time.Millisecond
+		}
+	}
+	return def
+}
+
 // ---- Main ----
 
 func main() {
 	addr := flag.String("addr", envOrDefault("RELAY_ADDR", ":8411"), "listen address")
 	maxBuf := flag.Int("max-buffer-frames", 200, "max frames buffered per connection while daemon is connecting")
 	logFormat := flag.String("log-format", envOrDefault("LOG_FORMAT", "text"), "log format: text or json")
+	maxMsgBytes := flag.Int64("max-message-bytes", envOrDefaultInt64("RELAY_MAX_MESSAGE_BYTES", defaultMaxMessageBytes), "max WebSocket message size in bytes")
+	attachTimeout := flag.Duration("data-attach-timeout", envOrDefaultDuration("RELAY_DATA_ATTACH_TIMEOUT", 15*time.Second), "max time to wait for daemon data socket before closing client")
 	printVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+
+	maxMessageBytes = int(*maxMsgBytes)
+	maxPendingBytes = maxMessageBytes + 1
 
 	if *printVersion {
 		fmt.Println(version)
@@ -702,7 +748,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:    *addr,
-		Handler: &relayHandler{reg: reg},
+		Handler: &relayHandler{reg: reg, dataAttachTimeout: *attachTimeout},
 	}
 
 	go func() {
